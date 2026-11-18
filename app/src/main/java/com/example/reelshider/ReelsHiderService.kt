@@ -13,9 +13,6 @@ class ReelsHiderService : AccessibilityService() {
 
     companion object {
         private const val IG = "com.instagram.android"
-
-        // Couleur de la barre du bas d'Instagram en mode sombre.
-        // Ajuste si tu vois un rectangle de teinte différente (ex: 0xFF000000.toInt()).
         private const val COLOR_DARK = 0xFF0B1014.toInt()
         private const val COLOR_LIGHT = 0xFFFFFFFF.toInt()
     }
@@ -23,38 +20,109 @@ class ReelsHiderService : AccessibilityService() {
     private val wm by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
     private var overlay: View? = null
     private var lastBounds: Rect? = null
+    private var openedFromDm = false
 
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         val pkg = e.packageName?.toString() ?: return
         if (pkg == packageName) return
 
         if (pkg != IG) {
-            // On a quitté Instagram (hors barre de notifs / clavier) : on retire le cache.
             if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
                 !pkg.startsWith("com.android.systemui") &&
                 !pkg.contains("inputmethod")
-            ) removeOverlay()
+            ) {
+                removeOverlay()
+                openedFromDm = false
+            }
             return
         }
 
         val root = rootInActiveWindow ?: return
-        val tab = findReelsTab(root)
-        if (tab == null) {
+
+        // 1. Détecter si l'utilisateur est actuellement dans la messagerie (DM)
+        if (isInDirectMessages(root)) {
+            openedFromDm = true
             removeOverlay()
             return
         }
-        val r = Rect()
-        tab.getBoundsInScreen(r)
-        showOverlay(r)
+
+        // 2. Détecter si le flux Reels plein écran est affiché (ex: via swipe vers la gauche)
+        val reelsFeed = findReelsFeedContainer(root)
+        if (reelsFeed != null) {
+            // Si on vient des DM, on laisse voir le Reel envoyé par l'ami
+            if (openedFromDm) {
+                removeOverlay()
+                return
+            }
+            // Sinon, on recouvre le flux Reels d'un rectangle noir (en laissant la barre du bas accessible)
+            val feedRect = Rect()
+            reelsFeed.getBoundsInScreen(feedRect)
+            val tabBarTop = findBottomBarTop(root)
+            if (tabBarTop > 0 && feedRect.bottom > tabBarTop) {
+                feedRect.bottom = tabBarTop
+            }
+            showOverlay(feedRect)
+            return
+        }
+
+        // 3. On est revenu sur l'accueil / recherche / profil : réinitialiser le flag DM
+        val tab = findReelsTab(root)
+        if (tab != null && tab.isVisibleToUser) {
+            openedFromDm = false
+            val r = Rect()
+            tab.getBoundsInScreen(r)
+            if (r.width() > 0 && r.height() > 0) {
+                showOverlay(r)
+                return
+            }
+        }
+
+        // 4. Dans tous les autres cas (ex: transition vers les messages), retirer immédiatement
+        removeOverlay()
+    }
+
+    private fun isInDirectMessages(root: AccessibilityNodeInfo): Boolean {
+        // Présence de la zone de texte de message ou de la liste des conversations
+        val dmIds = listOf(
+            "$IG:id/row_thread_composer_edittext",
+            "$IG:id/direct_inbox_null_state",
+            "$IG:id/inbox_refreshable_thread_list_recyclerview"
+        )
+        return dmIds.any { id ->
+            root.findAccessibilityNodeInfosByViewId(id).any { it.isVisibleToUser }
+        }
+    }
+
+    private fun findReelsFeedContainer(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val viewerIds = listOf(
+            "$IG:id/clips_viewer_view_pager",
+            "$IG:id/clips_video_container"
+        )
+        for (id in viewerIds) {
+            val node = root.findAccessibilityNodeInfosByViewId(id).firstOrNull { it.isVisibleToUser }
+            if (node != null) return node
+        }
+        return null
+    }
+
+    private fun findBottomBarTop(root: AccessibilityNodeInfo): Int {
+        val tabBar = root.findAccessibilityNodeInfosByViewId("$IG:id/tab_bar").firstOrNull()
+        if (tabBar != null) {
+            val r = Rect()
+            tabBar.getBoundsInScreen(r)
+            return r.top
+        }
+        return -1
     }
 
     private fun findReelsTab(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        // 1) id connu de l'onglet Reels
-        root.findAccessibilityNodeInfosByViewId("$IG:id/clips_tab").firstOrNull()?.let { return it }
+        root.findAccessibilityNodeInfosByViewId("$IG:id/clips_tab")
+            .firstOrNull { it.isVisibleToUser }
+            ?.let { return it }
 
-        // 2) Secours : un noeud "Reels" situé dans le bas de l'écran
         val screenH = resources.displayMetrics.heightPixels
         return root.findAccessibilityNodeInfosByText("Reels").firstOrNull {
+            if (!it.isVisibleToUser) return@firstOrNull false
             val b = Rect()
             it.getBoundsInScreen(b)
             b.top > screenH * 0.85 && b.width() < resources.displayMetrics.widthPixels / 3
