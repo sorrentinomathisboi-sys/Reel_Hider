@@ -1,8 +1,11 @@
 package com.example.reelshider
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Context
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.media.AudioManager
+import android.os.Build
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -18,9 +21,11 @@ class ReelsHiderService : AccessibilityService() {
     }
 
     private val wm by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
     private var overlay: View? = null
     private var lastBounds: Rect? = null
     private var openedFromDm = false
+    private var isMutedByUs = false
 
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         val pkg = e.packageName?.toString() ?: return
@@ -32,6 +37,7 @@ class ReelsHiderService : AccessibilityService() {
                 !pkg.contains("inputmethod")
             ) {
                 removeOverlay()
+                unmuteMediaIfNeeded()
                 openedFromDm = false
             }
             return
@@ -39,22 +45,26 @@ class ReelsHiderService : AccessibilityService() {
 
         val root = rootInActiveWindow ?: return
 
-        // 1. Détecter si l'utilisateur est actuellement dans la messagerie (DM)
+        // 1. Si l'utilisateur est dans les messages privés (DM)
         if (isInDirectMessages(root)) {
             openedFromDm = true
             removeOverlay()
+            unmuteMediaIfNeeded()
             return
         }
 
-        // 2. Détecter si le flux Reels plein écran est affiché (ex: via swipe vers la gauche)
+        // 2. Si le lecteur Reels plein écran est détecté (ex: via swipe vers la gauche)
         val reelsFeed = findReelsFeedContainer(root)
         if (reelsFeed != null) {
-            // Si on vient des DM, on laisse voir le Reel envoyé par l'ami
+            // Si on vient d'une conversation DM, on laisse la vidéo et le son
             if (openedFromDm) {
                 removeOverlay()
+                unmuteMediaIfNeeded()
                 return
             }
-            // Sinon, on recouvre le flux Reels d'un rectangle noir (en laissant la barre du bas accessible)
+
+            // Sinon : on coupe le son multimédia et on affiche le rectangle noir
+            muteMedia()
             val feedRect = Rect()
             reelsFeed.getBoundsInScreen(feedRect)
             val tabBarTop = findBottomBarTop(root)
@@ -65,7 +75,9 @@ class ReelsHiderService : AccessibilityService() {
             return
         }
 
-        // 3. On est revenu sur l'accueil / recherche / profil : réinitialiser le flag DM
+        // 3. Sur tout autre écran d'Instagram (Accueil, Recherche, Profil...), on rétablit le son
+        unmuteMediaIfNeeded()
+
         val tab = findReelsTab(root)
         if (tab != null && tab.isVisibleToUser) {
             openedFromDm = false
@@ -77,12 +89,37 @@ class ReelsHiderService : AccessibilityService() {
             }
         }
 
-        // 4. Dans tous les autres cas (ex: transition vers les messages), retirer immédiatement
+        // 4. Transition (ex: ouverture des DM) : retrait immédiat du cache
         removeOverlay()
     }
 
+    private fun muteMedia() {
+        if (isMutedByUs) return
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.setStreamMute(AudioManager.STREAM_MUSIC, true)
+            }
+            isMutedByUs = true
+        }
+    }
+
+    private fun unmuteMediaIfNeeded() {
+        if (!isMutedByUs) return
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.setStreamMute(AudioManager.STREAM_MUSIC, false)
+            }
+            isMutedByUs = false
+        }
+    }
+
     private fun isInDirectMessages(root: AccessibilityNodeInfo): Boolean {
-        // Présence de la zone de texte de message ou de la liste des conversations
         val dmIds = listOf(
             "$IG:id/row_thread_composer_edittext",
             "$IG:id/direct_inbox_null_state",
@@ -161,10 +198,14 @@ class ReelsHiderService : AccessibilityService() {
         lastBounds = null
     }
 
-    override fun onInterrupt() = removeOverlay()
+    override fun onInterrupt() {
+        removeOverlay()
+        unmuteMediaIfNeeded()
+    }
 
     override fun onDestroy() {
         removeOverlay()
+        unmuteMediaIfNeeded()
         super.onDestroy()
     }
 }
